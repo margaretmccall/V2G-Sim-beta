@@ -31,7 +31,7 @@ class CentralOptimization(object):
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
     def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
-              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False):
+              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .00137):
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -62,7 +62,7 @@ class CentralOptimization(object):
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization)
+                                          self.efinal, peak_shaving, penalization, peak_scalar)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
@@ -253,7 +253,7 @@ class CentralOptimization(object):
         print('')
 
     def process(self, times, vehicles, d, pmax, pmin, emin, emax,
-                efinal, peak_shaving, penalization, solver="gurobi"):
+                efinal, peak_shaving, penalization, peak_scalar, solver="gurobi"):
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
         subject to:
@@ -301,6 +301,9 @@ class CentralOptimization(object):
 
             # Lambda for hybrid model
             model.lamb = Param(initialize = .5)
+
+            # Scaling factor for peak-shaving sub-objective for hybrid model
+            model.peak_scalar = Param(initialize = peak_scalar)
 
             # Power
             model.p_max = Param(model.t, model.v, initialize=pmax, doc='P max')
@@ -362,7 +365,7 @@ class CentralOptimization(object):
             # No new constraints needed, but need to define lambda
             elif peak_shaving == 'hybrid': 
                 def objective_rule(model):
-                    return model.lamb * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
+                    return model.lamb * model.peak_scalar * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
                         (1-model.lamb) * sum([(model.d[t + 1] - model.d[t] + sum([model.u[t + 1, v] - model.u[t, v] for v in model.v]))**2 for t in model.t if t != last_t])
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
