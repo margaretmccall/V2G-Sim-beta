@@ -69,6 +69,7 @@ class CentralOptimization(object):
 
         # Post process results
         return self.post_process(project, net_load, opti_model, result, plot)
+        #return opti_model, result
 
     def initialize_net_load(self, net_load, real_number_of_vehicle, project):
         """Make sure that the net load has the right size and scale the net
@@ -251,7 +252,7 @@ class CentralOptimization(object):
         print('There is ' + str(unfeasible_vehicle) + ' unfeasible vehicle.')
         print('')
 
-    def process(self, times, vehicles, d, price, pmax, pmin, emin, emax,
+    def process(self, times, vehicles, d, pmax, pmin, emin, emax,
                 efinal, peak_shaving, penalization, solver="gurobi"):
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
@@ -290,12 +291,16 @@ class CentralOptimization(object):
             last_t = model.t.last()
             model.v = Set(initialize=vehicles, doc='Vehicles')
 
+
             # ###### Parameters
             # Net load
             model.d = Param(model.t, initialize=d, doc='Net load')
 
             # Price
-            model.price = Param(model.t, initialize=price, doc='Prices')
+            #model.price = Param(model.t, initialize=price, doc='Prices')
+
+            # Lambda for hybrid model
+            model.lamb = Param(initialize = .5)
 
             # Power
             model.p_max = Param(model.t, model.v, initialize=pmax, doc='P max')
@@ -308,8 +313,10 @@ class CentralOptimization(object):
             model.e_final = Param(model.v, initialize=efinal, doc='final energy balance')
             # model.beta = Param(initialize=beta, doc='beta')
 
+
             # ###### Variable
             model.u = Var(model.t, model.v, domain=Integers, doc='Power used')
+
 
             # ###### Rules
             def maximum_power_rule(model, t, v):
@@ -355,9 +362,8 @@ class CentralOptimization(object):
             # No new constraints needed, but need to define lambda
             elif peak_shaving == 'hybrid': 
                 def objective_rule(model):
-                    lamb = .5 #weights peak shaving and ramp mitigation goals equally
-                    return lamb * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
-                        (1-lamb) * sum([(model.d[t + 1] - model.d[t] + sum([model.u[t + 1, v] - model.u[t, v] for v in model.v]))**2 for t in model.t if t != last_t])
+                    return model.lamb * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
+                        (1-model.lamb) * sum([(model.d[t + 1] - model.d[t] + sum([model.u[t + 1, v] - model.u[t, v] for v in model.v]))**2 for t in model.t if t != last_t])
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
             # Emergency
@@ -370,7 +376,7 @@ class CentralOptimization(object):
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
                 def max_call_rule(model, v):
-                    max_calls = 2 #max V2G calls in a week...need to calculate based on timesteps fed in
+                    max_calls = 2 #max V2G calls per vehicle in a week...need to calculate based on timesteps fed in
                     return sum(model.u[i, v] for i in model.t < 0) <= max_calls #hoping the first gives # of times power is discharging
                 model.max_call_rule = Constraint(model.v, rule=max_call_rule, doc='Max call rule')
 
@@ -383,8 +389,6 @@ class CentralOptimization(object):
                 def objective_rule(model):
                     return sum((model.u[t, v] * model.price[t] for v in model.v) for t in model.t)
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
-
-            
             
             results = opt.solve(model)
             # results.write()
