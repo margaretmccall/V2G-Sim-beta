@@ -299,12 +299,6 @@ class CentralOptimization(object):
             # Price
             #model.price = Param(model.t, initialize=price, doc='Prices')
 
-            # Lambda for hybrid model
-            model.lamb = Param(initialize = .5)
-
-            # Scaling factor for peak-shaving sub-objective for hybrid model
-            model.peak_scalar = Param(initialize = peak_scalar)
-
             # Power
             model.p_max = Param(model.t, model.v, initialize=pmax, doc='P max')
             model.p_min = Param(model.t, model.v, initialize=pmin, doc='P min')
@@ -316,9 +310,21 @@ class CentralOptimization(object):
             model.e_final = Param(model.v, initialize=efinal, doc='final energy balance')
             # model.beta = Param(initialize=beta, doc='beta')
 
+            #HYBRID
+            # Lambda for hybrid model
+            model.lamb = Param(initialize = .5)
+            # Scaling factor for peak-shaving sub-objective for hybrid model
+            model.peak_scalar = Param(initialize = peak_scalar)
+
+            #EMERGENCY
+            # Maximum number of times a vehicle can be called for V2G in emergency scenario
+            model.max_calls = Param(model.v, initialize = 2) #trying to initialize max_calls for each vehicle being 2
+            model.zero = Param(model.v, initialize = 0) #trying to get vector to assess if u is negative
+
 
             # ###### Variable
             model.u = Var(model.t, model.v, domain=Integers, doc='Power used')
+            model.num_export = Var(model.t, model.v, domain=Binary, doc='Power exported at timestep?')
 
 
             # ###### Rules
@@ -362,7 +368,6 @@ class CentralOptimization(object):
             ### MM additions
             # Hybrid
             # Definition: optimizes for both ramp mitigation and peak shaving
-            # No new constraints needed, but need to define lambda
             elif peak_shaving == 'hybrid': 
                 def objective_rule(model):
                     return model.lamb * model.peak_scalar * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
@@ -371,16 +376,24 @@ class CentralOptimization(object):
 
             # Emergency
             # Definition: Emergency V2G; mostly V1G but each vehicle can get called for V2G a certain number of times/year
-            # Clearly a new constraint, but do I need to create a new vehicle attribute to track this...?
             # Can be used either for peak shaving or ramp mitigation; for now just implementing peak shaving
             elif peak_shaving == 'emergency':
                 def objective_rule(model):
                     return sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t])
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
+                """def count_exports_rule(model, t, v):
+                    for t in model.t:
+                        for v in model.v:
+                            if value(model.u[t, v]) < 0:
+                                model.num_export[t, v] == 1  
+                            elif value(model.u[u, v]) >= 0:
+                                model.num_export[t, v] == 0
+                    return model.num_export
+                model.count_exports_rule = Constraint(model.t, model.v, rule=count_exports_rule, doc='Count exports rule')"""
+
                 def max_call_rule(model, v):
-                    max_calls = 2 #max V2G calls per vehicle in a week...need to calculate based on timesteps fed in
-                    return sum(model.u[i, v] for i in model.t < 0) <= max_calls #hoping the first gives # of times power is discharging
+                    return sum(value(model.u[t, v]) < 0 for t in model.t) <= model.max_calls[v]
                 model.max_call_rule = Constraint(model.v, rule=max_call_rule, doc='Max call rule')
 
             # Cost-based
