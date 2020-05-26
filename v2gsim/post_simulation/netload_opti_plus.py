@@ -31,7 +31,7 @@ class CentralOptimization(object):
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
     def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
-              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .00137):
+              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .01, peak_subtractor = 50000, price=pandas.DataFrame()): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -42,7 +42,7 @@ class CentralOptimization(object):
                 False if number is the same as in project
             SOC_margin (float): SOC margin that can be used by the optimization at the end of the day [0, 1]
             SOC_offset (float): energy offset [0, 1]
-            peak_shaving (bolean): if True ramping constraints are not taking in account within the objective else it is.
+            peak_shaving (boolean): if True ramping constraints are not taking in account within the objective else it is.
         """
         # Reset model
         self.times = []
@@ -57,12 +57,15 @@ class CentralOptimization(object):
         # Set the variables for the optimization
         new_net_load = self.initialize_net_load(net_load, real_number_of_vehicle, project)
         self.initialize_model(project, new_net_load, SOC_margin, SOC_offset)
+        
+        if peak_shaving=='cost':
+            price = self.initialize_price(price, net_load)
 
         # Run the optimization
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization, peak_scalar)
+                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
@@ -102,6 +105,30 @@ class CentralOptimization(object):
             new_net_load['netload'] *= scaling_factor
 
         return new_net_load
+
+    def initialize_price(self, price, net_load): ##>>>>
+        """Resample power price data to be on same frequency as net load data, and returns dictionary with timesteps instead of timestamps.
+        Args:
+            price (pandas.DataFrame): data frame with date index and a 'price' column (in $/MWh)
+            net_load (pandas.DataFrame): data frame with date index and a 'net_load' column in [W]
+        
+        Returns dictionary with 
+            """
+        # Check that price and net_load dataframes have same length
+        assert len(price) == len(net_load)
+        # Make sure we are not touching the initial data
+        new_price = price.copy()
+        # Resample the net load
+        new_price = new_price.resample(str(self.optimization_timestep) + 'T').first()
+
+
+        # Convert to timestep index instead of timestamps
+        temp_index = pandas.DataFrame(range(0, len(new_price)), columns=['index'])
+        # Set temp_index
+        temp_new_price = new_price.copy()
+        temp_new_price= temp_new_price.set_index(temp_index['index'])
+        # Return a dictionary
+        return temp_new_price.to_dict()['price']
 
     def check_energy_constraints_feasible(self, vehicle, SOC_init, SOC_final, SOC_offset, verbose=False):
         """Make sure that SOC final can be reached from SOC init under uncontrolled
@@ -160,7 +187,7 @@ class CentralOptimization(object):
         Args:
             net_load (pandas.DataFrame): data frame with date index and a 'net_load' column in [W]
 
-        Retrun:
+        Return:
             net_load as a dictionary with time ids, time ids
         """
         temp_index = pandas.DataFrame(range(0, len(net_load)), columns=['index'])
@@ -253,7 +280,8 @@ class CentralOptimization(object):
         print('')
 
     def process(self, times, vehicles, d, pmax, pmin, emin, emax,
-                efinal, peak_shaving, penalization, peak_scalar, solver="gurobi"):
+                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, solver="gurobi"):
+
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
         subject to:
@@ -296,9 +324,6 @@ class CentralOptimization(object):
             # Net load
             model.d = Param(model.t, initialize=d, doc='Net load')
 
-            # Price
-            #model.price = Param(model.t, initialize=price, doc='Prices')
-
             # Power
             model.p_max = Param(model.t, model.v, initialize=pmax, doc='P max')
             model.p_min = Param(model.t, model.v, initialize=pmin, doc='P min')
@@ -311,15 +336,25 @@ class CentralOptimization(object):
             # model.beta = Param(initialize=beta, doc='beta')
 
             #HYBRID
-            # Lambda for hybrid model
-            model.lamb = Param(initialize = .5)
-            # Scaling factor for peak-shaving sub-objective for hybrid model
-            model.peak_scalar = Param(initialize = peak_scalar)
+            if peak_shaving == 'hybrid':
+                # Lambda for hybrid model
+                model.lamb = Param(initialize = .5)
+                # Scaling factor for peak-shaving sub-objective for hybrid model
+                model.peak_scalar = Param(initialize = peak_scalar)
+                # Normalization factor for peak-shaving sub-objective
+                model.peak_subtractor = Param(initialize = peak_subtractor)
 
             #EMERGENCY
-            # Maximum number of times a vehicle can be called for V2G in emergency scenario
-            model.max_calls = Param(model.v, initialize = 2) #trying to initialize max_calls for each vehicle being 2
-            model.zero = Param(model.v, initialize = 0) #trying to get vector to assess if u is negative
+            if peak_shaving == 'emergency':
+                # Maximum number of times a vehicle can be called for V2G in emergency scenario
+                model.max_calls = Param(model.v, initialize = 2) #trying to initialize max_calls for each vehicle being 2
+                model.zero = Param(model.v, initialize = 0) #trying to get vector to assess if u is negative
+
+            #COST
+            if peak_shaving == 'cost':
+                # Price
+                model.price = Param(model.t, initialize=price, doc='Prices') #energy price at each timestep
+
 
 
             # ###### Variable
@@ -370,7 +405,7 @@ class CentralOptimization(object):
             # Definition: optimizes for both ramp mitigation and peak shaving
             elif peak_shaving == 'hybrid': 
                 def objective_rule(model):
-                    return model.lamb * model.peak_scalar * sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) + \
+                    return model.lamb * model.peak_scalar * (sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t]) - model.peak_subtractor) + \
                         (1-model.lamb) * sum([(model.d[t + 1] - model.d[t] + sum([model.u[t + 1, v] - model.u[t, v] for v in model.v]))**2 for t in model.t if t != last_t])
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
@@ -400,10 +435,10 @@ class CentralOptimization(object):
             # Definition: minimizes charging cost based on given cost stack
             # Should probably only have visibility 24/48 hours into the future, ideally
             # V1G vs V2G will make a big difference here--incentivizing selling on-peak
-            # Need to feed in p (prices at t)
             elif peak_shaving == 'cost':
                 def objective_rule(model):
-                    return sum((model.u[t, v] * model.price[t] for v in model.v) for t in model.t)
+                    return sum([sum([model.u[t, v] * model.price[t] for t in model.t]) for v in model.v])
+                    #return sum((model.u[t, v] * model.price[t] for v in model.v) for t in model.t)
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
             
             results = opt.solve(model)
