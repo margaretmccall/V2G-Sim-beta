@@ -31,7 +31,7 @@ class CentralOptimization(object):
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
     def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
-              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .01, peak_subtractor = 50000, price=pandas.DataFrame()): #price can't be array, is dict; can't have non-default arg follow default
+              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .01, peak_subtractor = 50000, price=pandas.DataFrame(), calls=2): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -53,10 +53,11 @@ class CentralOptimization(object):
         self.emin = {}
         self.emax = {}
         self.efinal = {}
+        self.max_calls = {}
 
         # Set the variables for the optimization
         new_net_load = self.initialize_net_load(net_load, real_number_of_vehicle, project)
-        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset)
+        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, calls)
         
         if peak_shaving=='cost':
             price = self.initialize_price(price, net_load)
@@ -65,14 +66,14 @@ class CentralOptimization(object):
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price)
+                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, calls)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
 
         # Post process results
-        return self.post_process(project, net_load, opti_model, result, plot)
-        #return opti_model, result
+        #return self.post_process(project, net_load, opti_model, result, plot)
+        return opti_model, result
 
     def initialize_net_load(self, net_load, real_number_of_vehicle, project):
         """Make sure that the net load has the right size and scale the net
@@ -213,7 +214,7 @@ class CentralOptimization(object):
         else:
             return vehicle.SOC[self.SOC_index_to] - SOC_offset - SOC_margin
 
-    def initialize_model(self, project, net_load, SOC_margin, SOC_offset):
+    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, calls):
         """Select the vehicles that were plugged at controlled chargers and create
         the optimization variables (see inputs of optimization)
 
@@ -274,13 +275,16 @@ class CentralOptimization(object):
                                                  (SOC_final - SOC_init) * vehicle.car_model.battery_capacity *
                                                  (60 / self.optimization_timestep))})
 
+                # Create max_calls for each vehicle for emergency optimization ######################
+                self.max_calls.update({vehicle.id: calls})
+
         print('There is ' + str(vehicle_to_optimize) + ' vehicle participating in the optimization (' +
               str(vehicle_to_optimize * 100 / len(project.vehicles)) + '%)')
         print('There is ' + str(unfeasible_vehicle) + ' unfeasible vehicle.')
         print('')
 
     def process(self, times, vehicles, d, pmax, pmin, emin, emax,
-                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, solver="gurobi"):
+                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_calls, solver="gurobi"):
 
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
@@ -333,7 +337,6 @@ class CentralOptimization(object):
             model.e_max = Param(model.t, model.v, initialize=emax, doc='E max')
 
             model.e_final = Param(model.v, initialize=efinal, doc='final energy balance')
-            # model.beta = Param(initialize=beta, doc='beta')
 
             #HYBRID
             if peak_shaving == 'hybrid':
@@ -347,8 +350,7 @@ class CentralOptimization(object):
             #EMERGENCY
             if peak_shaving == 'emergency':
                 # Maximum number of times a vehicle can be called for V2G in emergency scenario
-                model.max_calls = Param(model.v, initialize = 2) #trying to initialize max_calls for each vehicle being 2
-                model.zero = Param(model.v, initialize = 0) #trying to get vector to assess if u is negative
+                model.max_calls = Param(model.v, initialize = max_calls) #trying to initialize max_calls for each vehicle being 2...need to make look like efinal
 
             #COST
             if peak_shaving == 'cost':
@@ -417,18 +419,8 @@ class CentralOptimization(object):
                     return sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t])
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
-                """def count_exports_rule(model, t, v):
-                    for t in model.t:
-                        for v in model.v:
-                            if value(model.u[t, v]) < 0:
-                                model.num_export[t, v] == 1  
-                            elif value(model.u[u, v]) >= 0:
-                                model.num_export[t, v] == 0
-                    return model.num_export
-                model.count_exports_rule = Constraint(model.t, model.v, rule=count_exports_rule, doc='Count exports rule')"""
-
                 def max_call_rule(model, v):
-                    return sum(value(model.u[t, v]) < 0 for t in model.t) <= model.max_calls[v]
+                    return len([x for x in [model.u[t, v] for t in model.t] if x < 0]) <= model.max_calls[v]
                 model.max_call_rule = Constraint(model.v, rule=max_call_rule, doc='Max call rule')
 
             # Cost-based
