@@ -31,8 +31,8 @@ class CentralOptimization(object):
         self.SOC_index_from = int((date_from - project.date).total_seconds() / project.timestep)
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
-    def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
-              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar = .01, peak_subtractor = 50000, price=pandas.DataFrame(), calls=2): #price can't be array, is dict; can't have non-default arg follow default
+    def solve(self, project, net_load, unoptimized_demand, real_number_of_vehicle, SOC_margin=0.02,
+              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, price=pandas.DataFrame(), calls=2): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -57,11 +57,16 @@ class CentralOptimization(object):
         self.max_calls = {}
 
         # Set the variables for the optimization
-        new_net_load = self.initialize_net_load(net_load, real_number_of_vehicle, project)
+        new_net_load, new_unoptimized_demand = self.initialize_net_load(net_load, real_number_of_vehicle, project, unoptimized_demand)
         self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, calls)
         
         if peak_shaving=='cost':
             price = self.initialize_price(price, net_load)
+
+        elif peak_shaving=='hybrid':
+            peak_scalar, peak_subtractor = self.get_peak_scalar(new_net_load, new_unoptimized_demand)
+            print(peak_scalar)
+            print(peak_subtractor)
 
         # Run the optimization
         timer = time.time()
@@ -76,7 +81,37 @@ class CentralOptimization(object):
         return self.post_process(project, net_load, opti_model, result, plot)
         #return opti_model, result
 
-    def initialize_net_load(self, net_load, real_number_of_vehicle, project):
+    def get_peak_scalar(self, net_load_updated, unoptimized_demand):
+        """
+        Args: 
+            net_load_updated: series of net load without vehicle loads
+            unoptimized_demand: series of unoptimized vehicle loads, scaled appropriately
+        Returns:
+            peak_scalar (multiplier for peak-minimization argument in objective fxn)
+            peak_subtractor (to be subtracted from peak-min arg in obj fxn, to center around 0)
+        
+        """
+        #Combining net load and unoptimized demand
+        new_load = pandas.DataFrame()
+        new_load['load'] = numpy.array(net_load_updated['netload']) + numpy.array(unoptimized_demand)
+        
+        # Normalizing peak load (subtracting mean)
+        peak_subtractor = numpy.mean(new_load['load'])
+        norm_load = new_load['load'] - peak_subtractor
+
+        # Scaling factor for peak shaving: sum of squared values at each timestep
+        peak_scale = sum(x**2 for x in norm_load)
+
+        # Scaling factor for ramp mitigation: sum of squared ramp rate between all timesteps
+        ramp_rate = new_load.subtract(new_load.shift(-1)).dropna()
+        ramp_scale = sum(x**2 for x in ramp_rate['load'])
+
+        # Getting comparative scaling factor for peak-shaving side of hybrid optimization objective
+        peak_scalar = ramp_scale / peak_scale
+        
+        return peak_scalar, peak_subtractor
+    
+    def initialize_net_load(self, net_load, real_number_of_vehicle, project, unoptimized_demand):
         """Make sure that the net load has the right size and scale the net
         load for the optimization scale.
 
@@ -87,8 +122,12 @@ class CentralOptimization(object):
         # Make sure we are not touching the initial data
         new_net_load = net_load.copy()
 
-        # Resample the net load
+        # Resample the net load & unoptimized demand
         new_net_load = new_net_load.resample(str(self.optimization_timestep) + 'T').first()
+        new_unoptimized_demand = unoptimized_demand.resample(str(self.optimization_timestep) + 'T').first()
+
+        # Check that new net load and new unoptimized demand are same length
+        assert len(new_net_load) == len(new_unoptimized_demand)
 
         # Check against the actual lenght it should have
         diff = (len(new_net_load) -
@@ -106,7 +145,7 @@ class CentralOptimization(object):
             # Scale the temp net load
             new_net_load['netload'] *= scaling_factor
 
-        return new_net_load
+        return new_net_load, new_unoptimized_demand
 
     def initialize_price(self, price, net_load): ##>>>>
         """Resample power price data to be on same frequency as net load data, and returns dictionary with timesteps instead of timestamps.
@@ -343,8 +382,8 @@ class CentralOptimization(object):
 
             #HYBRID
             if peak_shaving == 'hybrid':
-                # Lambda for hybrid model
-                model.lamb = Param(initialize = .5)
+                # Lambda for hybrid model--1 is all weight on peak shaving
+                model.lamb = Param(initialize = .9)
                 # Scaling factor for peak-shaving sub-objective for hybrid model
                 model.peak_scalar = Param(initialize = peak_scalar)
                 # Normalization factor for peak-shaving sub-objective
