@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import division
 from pyomo.opt import SolverFactory
 from pyomo.environ import *
@@ -72,8 +73,8 @@ class CentralOptimization(object):
         print('')
 
         # Post process results
-        #return self.post_process(project, net_load, opti_model, result, plot)
-        return opti_model, result
+        return self.post_process(project, net_load, opti_model, result, plot)
+        #return opti_model, result
 
     def initialize_net_load(self, net_load, real_number_of_vehicle, project):
         """Make sure that the net load has the right size and scale the net
@@ -308,9 +309,11 @@ class CentralOptimization(object):
 
         Return:
             model (ConcreteModel), result
-        """
+            """
+        
 
         # Select gurobi solver
+         
         with SolverFactory(solver) as opt:
             # Solver option see Gurobi website
             # opt.options['Method'] = 1
@@ -347,21 +350,24 @@ class CentralOptimization(object):
                 # Normalization factor for peak-shaving sub-objective
                 model.peak_subtractor = Param(initialize = peak_subtractor)
 
-            #EMERGENCY
-            if peak_shaving == 'emergency':
-                # Maximum number of times a vehicle can be called for V2G in emergency scenario
-                model.max_calls = Param(model.v, initialize = max_calls) #trying to initialize max_calls for each vehicle being 2...need to make look like efinal
-
             #COST
             if peak_shaving == 'cost':
                 # Price
                 model.price = Param(model.t, initialize=price, doc='Prices') #energy price at each timestep
 
+            #EMERGENCY
+            if peak_shaving == 'emergency':
+                # Maximum Wh a vehicle can export over course of optimization (battery capacity * given fraction)
+                model.max_calls = Param(model.v, initialize = max_calls)
 
 
             # ###### Variable
+            
+
+            #model.b = Var(model.t, model.v, domain=Binary, doc='Power exported at timestep?') #should it be within=Binary?
+            #model.u_neg = Var(model.t, model.v, domain=Integers, doc='Power used')
+            #model.u_pos = Var(model.t, model.v, domain=Integers, doc='Power used') 
             model.u = Var(model.t, model.v, domain=Integers, doc='Power used')
-            model.num_export = Var(model.t, model.v, domain=Binary, doc='Power exported at timestep?')
 
 
             # ###### Rules
@@ -372,6 +378,27 @@ class CentralOptimization(object):
             def minimum_power_rule(model, t, v):
                 return model.u[t, v] >= model.p_min[t, v]
             model.power_min_rule = Constraint(model.t, model.v, rule=minimum_power_rule, doc='P min rule')
+            # you'd have four rules instead: 1 for charging (>0, <pmax), 1 for discharging (<0, >pmin)
+            # u is just the sum of those two things. basically the same thing, but now 3 decision vars
+
+            #do we need to worry about big neg + big +? constrain one to be 0 if other is not 0?
+            # if i do whole problem w u_neg and u_post instead of u, takes care of the issue
+            # where u_neg is super neg & vv
+            # bc when calculating the amount of energy in the battery, there's an efficiency term
+            # assigned to the in and the out...bc if both were values, there'd be more losses
+            # 
+
+            #def maximum_power_rule(model, t, v):
+            #    return model.u_pos[t, v] <= model.p_max[t, v]
+            #model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
+
+            #def positive_power_rule(model, t, v):
+             #   return model.u_pos[t, v] >= 0
+            #rederfine, and do for 2 negative ones -- model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
+
+            #def u_sum(model, t, v):
+             #   return model.u = model.u_neg + model.u_pos #...
+
 
             def minimum_energy_rule(model, t, v):
                 return sum(model.u[i, v] for i in range(0, t + 1)) >= model.e_min[t, v]
@@ -384,6 +411,23 @@ class CentralOptimization(object):
             def final_energy_balance(model, v):
                 return sum(model.u[i, v] for i in model.t) >= model.e_final[v]
             model.final_energy_rule = Constraint(model.v, rule=final_energy_balance, doc='E final rule')
+
+            #def not_two_values:
+             #   return minimum( maximum(u_neg, 0), minimum(u_pos, 0))==0 # too hard...can you even put min/max in constraints? no?
+                # have to somehow penalize them with an efficiency thing to prevent simultaneous charging/discharging
+                # need variable that's gonna be relative to the losses...add a little bit of each charge/discharge
+                # to objective function (an additive term...just like adding a constant...doesn't have to be on same scale, but if scale too small, could be ~epsilon). 3 orders of magnitude
+                # def wanna look at u_neg/u_pos afterwards to see if one is 0 and other not*****
+                # check out google pyomo forum; respnsive
+                # if optimization works, it works
+                # could do fake losses terms where you multiply u_neg*0.9 &
+
+            #def power_export_rule(model, t, v):
+             #   return model.b[t, v] for model.u[t, v] < 0 == 1 ###this is the tricky part ## b is min of 0 or u. if else ok in constr
+                ## if u is +...if t is something, but NOT variables
+                # constraint: model.b <0
+                # constraint: model.b > u
+            
 
             # Set the objective to be either peak shaving or ramp mitigation
             if peak_shaving == 'peak_shaving':
@@ -417,11 +461,34 @@ class CentralOptimization(object):
             elif peak_shaving == 'emergency':
                 def objective_rule(model):
                     return sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t])
+                    # minimize obj function that has model.b term in it
+                    # u should be cut into two parts--charging and discharging
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
-                def max_call_rule(model, v):
-                    return len([x for x in [model.u[t, v] for t in model.t] if x < 0]) <= model.max_calls[v]
-                model.max_call_rule = Constraint(model.v, rule=max_call_rule, doc='Max call rule')
+                
+                ### Put constraint on negative part!!
+                # define another variable: model.c (counting) 
+
+                #model.c = Var(...)
+
+              #  rule count(): # try to force count to be 0 unless it can be below 0...model.c > model.u...so when u is positive
+                ### make it follow u, and set clear limits (can't be below 0), and ensure that optimization will
+                # try to make it 0 most of the time, except when it has the ability to not make it 0, only when
+                # you want to count one of the session. only time optimization can minimize this term (ie, be something /= 0)
+                # is when u is negative
+
+#                def negative_power(model, v):
+             #       return sum([model.u_neg for ])
+
+                # Could use mod to constrain sessions of discharging...as soon as you have X timesteps
+                # consecutive that you're discharging...harder
+                # if you want to count how many times u_neg is below zero, easy--if < 0, +1 this var
+                # this would include counting variable in objective function...
+                
+                def max_calls_rule(model, v):
+                    return sum([model.b[t, v] for t in model.t]) <= model.max_calls[v] 
+                    #return len([x for x in [model.u[t, v] for t in model.t] if x < 0]) <= model.max_calls[v] 
+                model.max_calls_rule = Constraint(model.v, rule=max_calls_rule, doc='Max output rule')
 
             # Cost-based
             # Definition: minimizes charging cost based on given cost stack
@@ -433,7 +500,8 @@ class CentralOptimization(object):
                     #return sum((model.u[t, v] * model.price[t] for v in model.v) for t in model.t)
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
             
-            results = opt.solve(model)
+            solver_parameters = "ResultFile=model.ilp"
+            results = opt.solve(model, options_string=solver_parameters, symbolic_solver_labels=True)
             # results.write()
 
         return model, results
