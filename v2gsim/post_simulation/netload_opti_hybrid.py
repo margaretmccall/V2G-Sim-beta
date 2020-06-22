@@ -383,7 +383,7 @@ class CentralOptimization(object):
             #HYBRID
             if peak_shaving == 'hybrid':
                 # Lambda for hybrid model--1 is all weight on peak shaving
-                model.lamb = Param(initialize = .9)
+                model.lamb = Param(initialize = .5)
                 # Scaling factor for peak-shaving sub-objective for hybrid model
                 model.peak_scalar = Param(initialize = peak_scalar)
                 # Normalization factor for peak-shaving sub-objective

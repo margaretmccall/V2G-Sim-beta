@@ -33,7 +33,7 @@ class CentralOptimization(object):
 
     def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
               SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, 
-              unoptimized_demand = pandas.DataFrame(), price=pandas.DataFrame(), calls=-3000): #price can't be array, is dict; can't have non-default arg follow default
+              unoptimized_demand = pandas.DataFrame(), price=pandas.DataFrame(), max_export=-3000): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -55,11 +55,11 @@ class CentralOptimization(object):
         self.emin = {}
         self.emax = {}
         self.efinal = {}
-        self.max_calls = {}
+        self.export_limit = {}
 
         # Set the variables for the optimization
         new_net_load, new_unoptimized_demand = self.initialize_net_load(net_load, real_number_of_vehicle, project, unoptimized_demand)
-        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, calls)
+        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, max_export)
         
         if peak_shaving=='cost':
             price = self.initialize_price(price, net_load)
@@ -73,7 +73,7 @@ class CentralOptimization(object):
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, calls)
+                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_export)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
@@ -255,7 +255,7 @@ class CentralOptimization(object):
         else:
             return vehicle.SOC[self.SOC_index_to] - SOC_offset - SOC_margin
 
-    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, calls):
+    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, max_export):
         """Select the vehicles that were plugged at controlled chargers and create
         the optimization variables (see inputs of optimization)
 
@@ -316,8 +316,8 @@ class CentralOptimization(object):
                                                  (SOC_final - SOC_init) * vehicle.car_model.battery_capacity *
                                                  (60 / self.optimization_timestep))})
 
-                # Create max_calls for each vehicle for emergency optimization ######################
-                self.max_calls.update({vehicle.id: calls})
+                # Create export_limit for each vehicle for emergency optimization ######################
+                self.export_limit.update({vehicle.id: max_export})
 
         print('There is ' + str(vehicle_to_optimize) + ' vehicle participating in the optimization (' +
               str(vehicle_to_optimize * 100 / len(project.vehicles)) + '%)')
@@ -325,7 +325,7 @@ class CentralOptimization(object):
         print('')
 
     def process(self, times, vehicles, d, pmax, pmin, emin, emax,
-                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_calls, solver="gurobi"):
+                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, export_limit, solver="gurobi"):
 
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
@@ -398,7 +398,7 @@ class CentralOptimization(object):
             #EMERGENCY
             if peak_shaving == 'emergency':
                 # Maximum Wh a vehicle can export over course of optimization (battery capacity * given fraction)
-                model.max_calls = Param(model.v, initialize = max_calls)
+                model.export_limit = Param(model.v, initialize = export_limit)
 
 
             # ###### Variable
@@ -482,7 +482,7 @@ class CentralOptimization(object):
 
                 # V2G (export) limits
                 def max_export_rule(model, v): 
-                    return sum(model.u_neg[i, v] for i in model.t) >= model.max_calls[v]
+                    return sum(model.u_neg[i, v] for i in model.t) >= model.export_limit[v]
                 model.max_export_rule = Constraint(model.v, rule=max_export_rule, doc='Max export rule')
 
 
