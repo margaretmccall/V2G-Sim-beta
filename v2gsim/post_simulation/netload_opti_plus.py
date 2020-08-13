@@ -31,8 +31,9 @@ class CentralOptimization(object):
         self.SOC_index_from = int((date_from - project.date).total_seconds() / project.timestep)
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
-    def solve(self, project, net_load, unoptimized_demand, real_number_of_vehicle, SOC_margin=0.02,
-              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, price=pandas.DataFrame(), calls=2): #price can't be array, is dict; can't have non-default arg follow default
+    def solve(self, project, net_load, unoptimized_demand, real_number_of_vehicle, SOC_margin=0.02, 
+              SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, 
+              price=pandas.DataFrame(), max_export=-3000): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -54,11 +55,12 @@ class CentralOptimization(object):
         self.emin = {}
         self.emax = {}
         self.efinal = {}
-        self.max_calls = {}
+        self.export_limit = {}
+
 
         # Set the variables for the optimization
         new_net_load, new_unoptimized_demand = self.initialize_net_load(net_load, real_number_of_vehicle, project, unoptimized_demand)
-        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, calls)
+        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, max_export) 
         
         if peak_shaving=='cost':
             price = self.initialize_price(price, net_load)
@@ -72,13 +74,13 @@ class CentralOptimization(object):
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, calls)
+                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_export)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
 
         # Post process results
-        return self.post_process(project, net_load, opti_model, result, plot)
+        return self.post_process(project, net_load, opti_model, result, plot), opti_model ##ADDED OPTI_MODEL
         #return opti_model, result
 
     def get_peak_scalar(self, net_load_updated, unoptimized_demand):
@@ -94,6 +96,8 @@ class CentralOptimization(object):
         #Combining net load and unoptimized demand
         new_load = pandas.DataFrame()
         new_load['load'] = numpy.array(net_load_updated['netload']) + numpy.array(unoptimized_demand)
+        plt.plot(numpy.array(net_load_updated['netload']))
+        plt.plot(numpy.array(unoptimized_demand))
         
         # Normalizing peak load (subtracting mean)
         peak_subtractor = numpy.mean(new_load['load'])
@@ -188,6 +192,11 @@ class CentralOptimization(object):
                 print('Set battery gain: ' + str((SOC_final - SOC_init) * 100) + '%')
                 print('Simulation battery gain: ' + str(diff * 100))
 
+        print('CHECKING SOC for vehicle '+str(vehicle.id))
+        print('SOC_init: '+str(SOC_init))
+        print('SOC_final: '+str(SOC_final))
+        
+
         # Check if below minimum SOC at any time
         if (min(vehicle.SOC[self.SOC_index_from:self.SOC_index_to]) - SOC_offset) <= self.minimum_SOC:
             if verbose:
@@ -198,6 +207,7 @@ class CentralOptimization(object):
         # Check SOC difference between date_from and date_to ?
         # Diff represent the minimum loss or the maximum gain
         diff = vehicle.SOC[self.SOC_index_to] - vehicle.SOC[self.SOC_index_from]
+        print('Diff between opti SOC diff and unopti SOC diff: '+str(SOC_final - SOC_init - diff))
         # Simulation show a battery gain
         if diff > 0:
             # Gain should be greater than the one we set up
@@ -254,7 +264,7 @@ class CentralOptimization(object):
         else:
             return vehicle.SOC[self.SOC_index_to] - SOC_offset - SOC_margin
 
-    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, calls):
+    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, max_export):
         """Select the vehicles that were plugged at controlled chargers and create
         the optimization variables (see inputs of optimization)
 
@@ -272,6 +282,7 @@ class CentralOptimization(object):
         for vehicle in project.vehicles:
             if vehicle.result is not None:
                 # Get SOC init and SOC end
+                print("MADE IT TO SOC ASSIGNMENT")
                 SOC_init = self.get_initial_SOC(vehicle, SOC_offset)
                 SOC_final = self.get_final_SOC(vehicle, SOC_margin, SOC_offset)
 
@@ -308,15 +319,30 @@ class CentralOptimization(object):
                 temp_vehicle_result['emax'] = (temp_vehicle_result.energy * (project.timestep / (60 * self.optimization_timestep)) + 10000 +
                                                (self.maximum_SOC - SOC_init) * vehicle.car_model.battery_capacity *
                                                (60 / self.optimization_timestep))
+
                 self.emax.update(temp_vehicle_result.to_dict()['emax'])
+
+                
+
 
                 # Push efinal with vehicle key
                 self.efinal.update({vehicle.id: (temp_vehicle_result.tail(1).energy.values[0] * (project.timestep / (60 * self.optimization_timestep)) +
                                                  (SOC_final - SOC_init) * vehicle.car_model.battery_capacity *
                                                  (60 / self.optimization_timestep))})
 
-                # Create max_calls for each vehicle for emergency optimization ######################
-                self.max_calls.update({vehicle.id: calls})
+                print("")
+                print(vehicle.id)
+                print('last energy value:')
+                print(temp_vehicle_result.tail(1).energy.values[0])
+                print('SOC_final: '+str(SOC_final))
+                print('SOC_init: '+str(SOC_init))
+                print('HALF 1: '+str((temp_vehicle_result.tail(1).energy.values[0] * (project.timestep / (60 * self.optimization_timestep)))))
+                print('HALF 2: '+str((SOC_final - SOC_init) * vehicle.car_model.battery_capacity *(60 / self.optimization_timestep)))
+                print('EFINAL: '+str(self.efinal[vehicle.id]))
+                print("")
+
+                # Create export_limit for each vehicle for emergency optimization ######################
+                self.export_limit.update({vehicle.id: max_export})
 
         print('There is ' + str(vehicle_to_optimize) + ' vehicle participating in the optimization (' +
               str(vehicle_to_optimize * 100 / len(project.vehicles)) + '%)')
@@ -324,7 +350,7 @@ class CentralOptimization(object):
         print('')
 
     def process(self, times, vehicles, d, pmax, pmin, emin, emax,
-                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_calls, solver="gurobi"):
+                efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, export_limit, solver="gurobi"):
 
         """The process function creates the pyomo model and solve it.
         Minimize sum( net_load(t) + sum(power_demand(t, v)))**2
@@ -383,7 +409,7 @@ class CentralOptimization(object):
             #HYBRID
             if peak_shaving == 'hybrid':
                 # Lambda for hybrid model--1 is all weight on peak shaving
-                model.lamb = Param(initialize = .5)
+                model.lamb = Param(initialize = 1)
                 # Scaling factor for peak-shaving sub-objective for hybrid model
                 model.peak_scalar = Param(initialize = peak_scalar)
                 # Normalization factor for peak-shaving sub-objective
@@ -397,47 +423,47 @@ class CentralOptimization(object):
             #EMERGENCY
             if peak_shaving == 'emergency':
                 # Maximum Wh a vehicle can export over course of optimization (battery capacity * given fraction)
-                model.max_calls = Param(model.v, initialize = max_calls)
+                model.export_limit = Param(model.v, initialize = export_limit)
 
 
             # ###### Variable
-            
-
-            #model.b = Var(model.t, model.v, domain=Binary, doc='Power exported at timestep?') #should it be within=Binary?
-            #model.u_neg = Var(model.t, model.v, domain=Integers, doc='Power used')
-            #model.u_pos = Var(model.t, model.v, domain=Integers, doc='Power used') 
+            if peak_shaving == 'emergency':
+                model.u_neg = Var(model.t, model.v, domain=Integers, doc='Power exported')
+                model.u_pos = Var(model.t, model.v, domain=Integers, doc='Power imported')
             model.u = Var(model.t, model.v, domain=Integers, doc='Power used')
 
 
             # ###### Rules
-            def maximum_power_rule(model, t, v):
-                return model.u[t, v] <= model.p_max[t, v]
-            model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
 
-            def minimum_power_rule(model, t, v):
-                return model.u[t, v] >= model.p_min[t, v]
-            model.power_min_rule = Constraint(model.t, model.v, rule=minimum_power_rule, doc='P min rule')
-            # you'd have four rules instead: 1 for charging (>0, <pmax), 1 for discharging (<0, >pmin)
-            # u is just the sum of those two things. basically the same thing, but now 3 decision vars
+            if peak_shaving == 'emergency':
+                def max_charging_rule(model, t, v):
+                    return model.u_pos[t, v] <= model.p_max[t, v]
+                model.max_charging_rule = Constraint(model.t, model.v, rule=max_charging_rule, doc='u_pos <= p_max')
 
-            #do we need to worry about big neg + big +? constrain one to be 0 if other is not 0?
-            # if i do whole problem w u_neg and u_post instead of u, takes care of the issue
-            # where u_neg is super neg & vv
-            # bc when calculating the amount of energy in the battery, there's an efficiency term
-            # assigned to the in and the out...bc if both were values, there'd be more losses
-            # 
+                def min_charging_rule(model, t, v):
+                    return model.u_pos[t, v] >= 0
+                model.min_charging_rule = Constraint(model.t, model.v, rule=min_charging_rule, doc='u_pos >= 0')
 
-            #def maximum_power_rule(model, t, v):
-            #    return model.u_pos[t, v] <= model.p_max[t, v]
-            #model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
+                def max_discharging_rule(model, t, v):
+                    return model.u_neg[t, v] >= model.p_min[t, v]
+                model.max_discharging_rule = Constraint(model.t, model.v, rule=max_discharging_rule, doc='u_neg >= p_min')
 
-            #def positive_power_rule(model, t, v):
-             #   return model.u_pos[t, v] >= 0
-            #rederfine, and do for 2 negative ones -- model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
+                def min_discharging_rule(model, t, v):
+                    return model.u_neg[t, v] <= 0
+                model.min_discharging_rule = Constraint(model.t, model.v, rule=min_discharging_rule, doc='u_neg <= 0')
 
-            #def u_sum(model, t, v):
-             #   return model.u = model.u_neg + model.u_pos #...
+                def total_power_rule(model, t, v):
+                    return model.u[t, v] == model.u_neg[t, v] + model.u_pos[t, v]
+                model.total_power_rule = Constraint(model.t, model.v, rule=total_power_rule, doc='u = u_neg + u_pos')
+            
+            elif peak_shaving != 'emergency':
+                def maximum_power_rule(model, t, v):
+                    return model.u[t, v] <= model.p_max[t, v]
+                model.power_max_rule = Constraint(model.t, model.v, rule=maximum_power_rule, doc='P max rule')
 
+                def minimum_power_rule(model, t, v):
+                    return model.u[t, v] >= model.p_min[t, v]
+                model.power_min_rule = Constraint(model.t, model.v, rule=minimum_power_rule, doc='P min rule')
 
             def minimum_energy_rule(model, t, v):
                 return sum(model.u[i, v] for i in range(0, t + 1)) >= model.e_min[t, v]
@@ -451,22 +477,6 @@ class CentralOptimization(object):
                 return sum(model.u[i, v] for i in model.t) >= model.e_final[v]
             model.final_energy_rule = Constraint(model.v, rule=final_energy_balance, doc='E final rule')
 
-            #def not_two_values:
-             #   return minimum( maximum(u_neg, 0), minimum(u_pos, 0))==0 # too hard...can you even put min/max in constraints? no?
-                # have to somehow penalize them with an efficiency thing to prevent simultaneous charging/discharging
-                # need variable that's gonna be relative to the losses...add a little bit of each charge/discharge
-                # to objective function (an additive term...just like adding a constant...doesn't have to be on same scale, but if scale too small, could be ~epsilon). 3 orders of magnitude
-                # def wanna look at u_neg/u_pos afterwards to see if one is 0 and other not*****
-                # check out google pyomo forum; respnsive
-                # if optimization works, it works
-                # could do fake losses terms where you multiply u_neg*0.9 &
-
-            #def power_export_rule(model, t, v):
-             #   return model.b[t, v] for model.u[t, v] < 0 == 1 ###this is the tricky part ## b is min of 0 or u. if else ok in constr
-                ## if u is +...if t is something, but NOT variables
-                # constraint: model.b <0
-                # constraint: model.b > u
-            
 
             # Set the objective to be either peak shaving or ramp mitigation
             if peak_shaving == 'peak_shaving':
@@ -498,36 +508,15 @@ class CentralOptimization(object):
             # Definition: Emergency V2G; mostly V1G but each vehicle can get called for V2G a certain number of times/year
             # Can be used either for peak shaving or ramp mitigation; for now just implementing peak shaving
             elif peak_shaving == 'emergency':
+                # Peak shaving objective
                 def objective_rule(model):
                     return sum([(model.d[t] + sum([model.u[t, v] for v in model.v]))**2 for t in model.t])
-                    # minimize obj function that has model.b term in it
-                    # u should be cut into two parts--charging and discharging
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
 
-                
-                ### Put constraint on negative part!!
-                # define another variable: model.c (counting) 
-
-                #model.c = Var(...)
-
-              #  rule count(): # try to force count to be 0 unless it can be below 0...model.c > model.u...so when u is positive
-                ### make it follow u, and set clear limits (can't be below 0), and ensure that optimization will
-                # try to make it 0 most of the time, except when it has the ability to not make it 0, only when
-                # you want to count one of the session. only time optimization can minimize this term (ie, be something /= 0)
-                # is when u is negative
-
-#                def negative_power(model, v):
-             #       return sum([model.u_neg for ])
-
-                # Could use mod to constrain sessions of discharging...as soon as you have X timesteps
-                # consecutive that you're discharging...harder
-                # if you want to count how many times u_neg is below zero, easy--if < 0, +1 this var
-                # this would include counting variable in objective function...
-                
-                def max_calls_rule(model, v):
-                    return sum([model.b[t, v] for t in model.t]) <= model.max_calls[v] 
-                    #return len([x for x in [model.u[t, v] for t in model.t] if x < 0]) <= model.max_calls[v] 
-                model.max_calls_rule = Constraint(model.v, rule=max_calls_rule, doc='Max output rule')
+                # V2G (export) limits
+                def max_export_rule(model, v): 
+                    return sum(model.u_neg[i, v] for i in model.t) >= model.export_limit[v]
+                model.max_export_rule = Constraint(model.v, rule=max_export_rule, doc='Max export rule')
 
             # Cost-based
             # Definition: minimizes charging cost based on given cost stack
