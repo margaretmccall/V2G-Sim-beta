@@ -31,7 +31,7 @@ class CentralOptimization(object):
         self.SOC_index_from = int((date_from - project.date).total_seconds() / project.timestep)
         self.SOC_index_to = int((date_to - project.date).total_seconds() / project.timestep)
 
-    def solve(self, project, net_load, unoptimized_demand, real_number_of_vehicle, SOC_margin=0.02, 
+    def solve(self, project, net_load, unoptimized_demand, real_number_of_vehicle, SOC_init_opti=None, SOC_end_opti=None, SOC_margin=0.02, ##ADDED
               SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, 
               price=pandas.DataFrame(), max_export=-3000): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
@@ -58,9 +58,10 @@ class CentralOptimization(object):
         self.export_limit = {}
 
 
+
         # Set the variables for the optimization
         new_net_load, new_unoptimized_demand = self.initialize_net_load(net_load, real_number_of_vehicle, project, unoptimized_demand)
-        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, max_export) 
+        self.initialize_model(project, new_net_load, SOC_margin, SOC_offset, SOC_init_opti, SOC_end_opti, max_export) ##ADDED
         
         if peak_shaving=='cost':
             price = self.initialize_price(price, net_load)
@@ -80,7 +81,7 @@ class CentralOptimization(object):
         print('')
 
         # Post process results
-        return self.post_process(project, net_load, opti_model, result, plot), opti_model ##ADDED OPTI_MODEL
+        return self.post_process(project, net_load, opti_model, result, plot), opti_model, result ##ADDED OPTI_MODEL ad RESULT
         #return opti_model, result
 
     def get_peak_scalar(self, net_load_updated, unoptimized_demand):
@@ -191,10 +192,6 @@ class CentralOptimization(object):
         def print_status(SOC_final, SOC_init, diff):
                 print('Set battery gain: ' + str((SOC_final - SOC_init) * 100) + '%')
                 print('Simulation battery gain: ' + str(diff * 100))
-
-        print('CHECKING SOC for vehicle '+str(vehicle.id))
-        print('SOC_init: '+str(SOC_init))
-        print('SOC_final: '+str(SOC_final))
         
 
         # Check if below minimum SOC at any time
@@ -207,7 +204,7 @@ class CentralOptimization(object):
         # Check SOC difference between date_from and date_to ?
         # Diff represent the minimum loss or the maximum gain
         diff = vehicle.SOC[self.SOC_index_to] - vehicle.SOC[self.SOC_index_from]
-        print('Diff between opti SOC diff and unopti SOC diff: '+str(SOC_final - SOC_init - diff))
+        
         # Simulation show a battery gain
         if diff > 0:
             # Gain should be greater than the one we set up
@@ -264,7 +261,7 @@ class CentralOptimization(object):
         else:
             return vehicle.SOC[self.SOC_index_to] - SOC_offset - SOC_margin
 
-    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, max_export):
+    def initialize_model(self, project, net_load, SOC_margin, SOC_offset, SOC_init_opti, SOC_end_opti, max_export): ##ADDED
         """Select the vehicles that were plugged at controlled chargers and create
         the optimization variables (see inputs of optimization)
 
@@ -274,6 +271,9 @@ class CentralOptimization(object):
         Return:
             times, vehicles, d, pmax, pmin, emin, emax, efinal
         """
+
+
+
         # Create a dict with the net load and get time index in a data frame
         self.d, self.times = self.initialize_time_index(net_load)
         vehicle_to_optimize = 0
@@ -282,9 +282,13 @@ class CentralOptimization(object):
         for vehicle in project.vehicles:
             if vehicle.result is not None:
                 # Get SOC init and SOC end
-                print("MADE IT TO SOC ASSIGNMENT")
-                SOC_init = self.get_initial_SOC(vehicle, SOC_offset)
-                SOC_final = self.get_final_SOC(vehicle, SOC_margin, SOC_offset)
+                
+                if SOC_init_opti is not None: ##ADDED
+                    SOC_init = self.get_initial_SOC(vehicle, SOC_offset, SOC_init=SOC_init_opti[vehicle.id])
+                    SOC_final = self.get_final_SOC(vehicle, SOC_margin, SOC_offset, SOC_end=SOC_end_opti[vehicle.id])
+                elif SOC_init_opti is None:
+                    SOC_init = self.get_initial_SOC(vehicle, SOC_offset)
+                    SOC_final = self.get_final_SOC(vehicle, SOC_margin, SOC_offset)
 
                 # Find out if vehicle itinerary is feasible
                 if not self.check_energy_constraints_feasible(vehicle, SOC_init, SOC_final, SOC_offset):
@@ -330,16 +334,6 @@ class CentralOptimization(object):
                                                  (SOC_final - SOC_init) * vehicle.car_model.battery_capacity *
                                                  (60 / self.optimization_timestep))})
 
-                print("")
-                print(vehicle.id)
-                print('last energy value:')
-                print(temp_vehicle_result.tail(1).energy.values[0])
-                print('SOC_final: '+str(SOC_final))
-                print('SOC_init: '+str(SOC_init))
-                print('HALF 1: '+str((temp_vehicle_result.tail(1).energy.values[0] * (project.timestep / (60 * self.optimization_timestep)))))
-                print('HALF 2: '+str((SOC_final - SOC_init) * vehicle.car_model.battery_capacity *(60 / self.optimization_timestep)))
-                print('EFINAL: '+str(self.efinal[vehicle.id]))
-                print("")
 
                 # Create export_limit for each vehicle for emergency optimization ######################
                 self.export_limit.update({vehicle.id: max_export})
@@ -528,6 +522,7 @@ class CentralOptimization(object):
                     #return sum((model.u[t, v] * model.price[t] for v in model.v) for t in model.t)
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
             
+        
             solver_parameters = "ResultFile=model.ilp"
             results = opt.solve(model, options_string=solver_parameters, symbolic_solver_labels=True)
             # results.write()
@@ -698,7 +693,6 @@ def save_vehicle_state_for_optimization(vehicle, timestep, date_from,
                         # Energy is 0.0 because it's already accounted in power_demand
                         vehicle.result['energy'][location_index1:location_index2] -= (
                             [0.0] * (activity_index2 - activity_index1))
-
     elif init:
         vehicle.SOC = [vehicle.SOC[0]]
         vehicle.result = None
