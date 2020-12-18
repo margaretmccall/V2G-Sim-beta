@@ -33,7 +33,7 @@ class CentralOptimization(object):
 
     def solve(self, project, net_load, real_number_of_vehicle, SOC_margin=0.02,
               SOC_offset=0.0, peak_shaving='peak_shaving', penalization=5, beta=None, plot=False, peak_scalar=.01, peak_subtractor=30000, 
-              unoptimized_demand = pandas.DataFrame(), price=pandas.DataFrame(), max_export=-3000): #price can't be array, is dict; can't have non-default arg follow default
+              unoptimized_demand = pandas.DataFrame(), price=pandas.DataFrame(), max_export=.1): #price can't be array, is dict; can't have non-default arg follow default
         """Launch the optimization and the post_processing fucntion. Results
         and assumptions are appended to a data frame.
 
@@ -73,13 +73,13 @@ class CentralOptimization(object):
         timer = time.time()
         opti_model, result = self.process(self.times, self.vehicles, self.d, self.pmax,
                                           self.pmin, self.emin, self.emax,
-                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, max_export)
+                                          self.efinal, peak_shaving, penalization, peak_scalar, peak_subtractor, price, self.export_limit)
         timer2 = time.time()
         print('The optimization duration was ' + str((timer2 - timer) / 60) + ' minutes')
         print('')
 
         # Post process results
-        return self.post_process(project, net_load, opti_model, result, plot)
+        return self.post_process(project, net_load, opti_model, result, plot), opti_model, result ##ADDED OPTI_MODEL ad RESULT
         #return opti_model, result
 
     def get_peak_scalar(self, net_load_updated, unoptimized_demand):
@@ -133,11 +133,13 @@ class CentralOptimization(object):
         # Check against the actual lenght it should have
         diff = (len(new_net_load) -
                 int((self.date_to - self.date_from).total_seconds() / (60 * self.optimization_timestep)))
+        
         if diff > 0:
             # We should trim the net load with diff elements (normaly 1 because of slicing inclusion)
             new_net_load.drop(new_net_load.tail(diff).index, inplace=True)
         elif diff < 0:
             print('The net load does not contain enough data points')
+            
 
         if real_number_of_vehicle:
             # Set scaling factor
@@ -317,7 +319,7 @@ class CentralOptimization(object):
                                                  (60 / self.optimization_timestep))})
 
                 # Create export_limit for each vehicle for emergency optimization ######################
-                self.export_limit.update({vehicle.id: max_export})
+                self.export_limit.update({vehicle.id: -1 * vehicle.car_model.battery_capacity * max_export})
 
         print('There is ' + str(vehicle_to_optimize) + ' vehicle participating in the optimization (' +
               str(vehicle_to_optimize * 100 / len(project.vehicles)) + '%)')

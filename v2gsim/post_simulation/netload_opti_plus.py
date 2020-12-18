@@ -403,7 +403,7 @@ class CentralOptimization(object):
             #HYBRID
             if peak_shaving == 'hybrid':
                 # Lambda for hybrid model--1 is all weight on peak shaving
-                model.lamb = Param(initialize = 1)
+                model.lamb = Param(initialize = 0)
                 # Scaling factor for peak-shaving sub-objective for hybrid model
                 model.peak_scalar = Param(initialize = peak_scalar)
                 # Normalization factor for peak-shaving sub-objective
@@ -523,7 +523,8 @@ class CentralOptimization(object):
                 model.objective = Objective(rule=objective_rule, sense=minimize, doc='Define objective function')
             
         
-            solver_parameters = "ResultFile=model.ilp"
+            solver_parameters = "ResultFile=model.ilp, LogFile=model_log.log"
+            print('actually got to the point of running solve')
             results = opt.solve(model, options_string=solver_parameters, symbolic_solver_labels=True)
             # results.write()
 
